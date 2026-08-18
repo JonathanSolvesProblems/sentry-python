@@ -1,9 +1,11 @@
 import datetime
+import gc
 import importlib
 import logging
 import os
 import sys
 import time
+import weakref
 from collections import Counter
 
 import pytest
@@ -727,6 +729,77 @@ def test_dedupe_doesnt_take_into_account_dropped_exception(sentry_init, capture_
             capture_exception()
 
     assert len(events) == 1
+
+
+def test_dedupe_does_not_retain_builtin_exception(sentry_init, capture_events):
+    # Builtin exceptions cannot be weak referenced, so DedupeIntegration used to
+    # fall back to a strong reference. That pinned the exception, its traceback
+    # and every frame local reachable from that traceback for the lifetime of
+    # the enclosing context, which under asyncio is the lifetime of the task
+    # (#6094).
+    sentry_init()
+    events = capture_events()
+
+    class Payload:
+        pass
+
+    payload_ref = None
+
+    def raises_with_large_local():
+        nonlocal payload_ref
+        payload = Payload()
+        payload_ref = weakref.ref(payload)
+        raise ValueError("boom")
+
+    try:
+        raises_with_large_local()
+    except ValueError:
+        capture_exception()
+
+    (event,) = events
+    assert event["exception"]["values"][0]["type"] == "ValueError"
+
+    gc.collect()
+
+    # The frame local held by the traceback must be collectable once the
+    # exception goes out of scope.
+    assert payload_ref() is None
+
+
+def test_dedupe_still_dedupes_builtin_exception(sentry_init, capture_events):
+    # The leak fix must not change what gets deduplicated: the same builtin
+    # exception object captured twice is still a duplicate.
+    sentry_init()
+    events = capture_events()
+
+    try:
+        raise ValueError("aha!")
+    except Exception:
+        capture_exception()
+        try:
+            reraise(*sys.exc_info())
+        except Exception:
+            capture_exception()
+
+    assert len(events) == 1
+
+
+def test_dedupe_distinguishes_equal_builtin_exceptions(sentry_init, capture_events):
+    # Two distinct exceptions that compare equal by value and are raised from
+    # the same line are still two separate events.
+    sentry_init()
+    events = capture_events()
+
+    def do_this():
+        try:
+            raise ValueError("aha!")
+        except Exception:
+            capture_exception()
+
+    do_this()
+    do_this()
+
+    assert len(events) == 2
 
 
 def test_event_processor_drop_records_client_report(

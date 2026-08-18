@@ -7,9 +7,55 @@ from sentry_sdk.scope import add_global_event_processor
 from sentry_sdk.utils import ContextVar, logger
 
 if TYPE_CHECKING:
-    from typing import Optional
+    from typing import Any, Optional
 
     from sentry_sdk._types import Event, Hint
+
+
+#: Attribute used to attach a weak-referenceable identity token to exceptions
+#: that do not support weak references themselves.
+_DEDUPE_TOKEN_ATTR = "_sentry_dedupe_token"
+
+
+class _DedupeToken:
+    """A weak-referenceable stand-in for an exception's identity.
+
+    Builtin exceptions (``ValueError``, ``KeyError``, ...) cannot be weak
+    referenced. Storing the exception itself keeps it, its traceback, and every
+    frame local reachable from that traceback alive for as long as the
+    enclosing ``ContextVar`` lives. Under asyncio that is the lifetime of the
+    task, which is the leak reported in #6094.
+
+    A token is attached to the exception and only weakly referenced from here,
+    so it stays alive exactly as long as the exception does and dies with it.
+    Because there is one token per exception object, comparing tokens is
+    equivalent to comparing exception identity, so dedupe behaviour is
+    unchanged.
+    """
+
+    __slots__ = ("__weakref__",)
+
+
+def _identity_token(exc: BaseException) -> "Optional[_DedupeToken]":
+    """Return the dedupe token for ``exc``, attaching one if necessary.
+
+    Returns ``None`` if the exception cannot carry one, in which case the
+    caller falls back to the previous behaviour.
+    """
+    try:
+        exc_dict = exc.__dict__
+    except AttributeError:
+        return None
+
+    token = exc_dict.get(_DEDUPE_TOKEN_ATTR)
+    if token is None:
+        token = _DedupeToken()
+        try:
+            exc_dict[_DEDUPE_TOKEN_ATTR] = token
+        except (AttributeError, TypeError):
+            return None
+
+    return token
 
 
 class DedupeIntegration(Integration):
@@ -35,21 +81,38 @@ class DedupeIntegration(Integration):
 
             last_seen = integration._last_seen.get(None)
             if last_seen is not None:
-                # last_seen is either a weakref or the original instance
+                # last_seen is a weakref (to the exception or to its identity
+                # token) or the original instance
                 last_seen = (
                     last_seen() if isinstance(last_seen, weakref.ref) else last_seen
                 )
 
             exc = exc_info[1]
-            if last_seen is exc:
+
+            new_last_seen: "Any"
+            try:
+                # We can only weakref non builtin types.
+                new_last_seen = weakref.ref(exc)
+                is_duplicate = last_seen is exc
+            except TypeError:
+                # Builtin exception. Referencing it strongly here would pin its
+                # traceback and every frame local in that traceback for the
+                # lifetime of the ContextVar (#6094). Weakly reference an
+                # identity token carried by the exception instead, which dies
+                # with it and keeps dedupe keyed on exception identity.
+                token = _identity_token(exc)
+                if token is not None:
+                    new_last_seen = weakref.ref(token)
+                    is_duplicate = last_seen is token
+                else:
+                    new_last_seen = exc
+                    is_duplicate = last_seen is exc
+
+            if is_duplicate:
                 logger.info("DedupeIntegration dropped duplicated error event %s", exc)
                 return None
 
-            # we can only weakref non builtin types
-            try:
-                integration._last_seen.set(weakref.ref(exc))
-            except TypeError:
-                integration._last_seen.set(exc)
+            integration._last_seen.set(new_last_seen)
 
             return event
 
