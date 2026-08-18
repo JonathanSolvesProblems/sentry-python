@@ -784,6 +784,49 @@ def test_dedupe_still_dedupes_builtin_exception(sentry_init, capture_events):
     assert len(events) == 1
 
 
+def test_dedupe_survives_exotic_exception_dict(sentry_init, capture_events):
+    # An exception may expose __dict__ as a property returning a non-mapping, or
+    # back it with a mapping that refuses mutation. Neither may break event
+    # processing; dedupe just falls back to the previous behaviour.
+    sentry_init()
+    events = capture_events()
+
+    class NoDictException(Exception):
+        @property
+        def __dict__(self):
+            return None
+
+    class FrozenDict(dict):
+        def __setitem__(self, key, value):
+            raise ValueError("frozen")
+
+    class FrozenDictException(Exception):
+        def __init__(self):
+            self.__dict__ = FrozenDict()
+
+    for exc_type in (NoDictException, FrozenDictException):
+        try:
+            raise exc_type()
+        except Exception:
+            capture_exception()
+
+    assert len(events) == 2
+
+
+def test_dedupe_leaves_unraised_exception_untouched(sentry_init, capture_events):
+    # An exception with no traceback pins no frames, so there is nothing to fix
+    # and no reason to touch it. Keeping vars() clean matters for user code that
+    # serialises exception attributes.
+    sentry_init()
+    events = capture_events()
+
+    exc = ValueError("never raised")
+    capture_exception(exc)
+
+    (event,) = events
+    assert vars(exc) == {}
+
+
 def test_dedupe_distinguishes_equal_builtin_exceptions(sentry_init, capture_events):
     # Two distinct exceptions that compare equal by value and are raised from
     # the same line are still two separate events.

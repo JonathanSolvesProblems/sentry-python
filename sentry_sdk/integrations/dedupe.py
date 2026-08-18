@@ -39,23 +39,30 @@ class _DedupeToken:
 def _identity_token(exc: BaseException) -> "Optional[_DedupeToken]":
     """Return the dedupe token for ``exc``, attaching one if necessary.
 
-    Returns ``None`` if the exception cannot carry one, in which case the
-    caller falls back to the previous behaviour.
+    Returns ``None`` when the exception cannot carry a token, or when it has no
+    traceback. In both cases the caller keeps the previous behaviour: without a
+    traceback there are no frames and no frame locals reachable through the
+    exception, so holding it strongly cannot pin anything, and leaving such
+    exceptions untouched keeps ``vars(exc)`` clean for the common case of an
+    exception that was constructed but never raised.
     """
     try:
-        exc_dict = exc.__dict__
-    except AttributeError:
-        return None
-
-    token = exc_dict.get(_DEDUPE_TOKEN_ATTR)
-    if token is None:
-        token = _DedupeToken()
-        try:
-            exc_dict[_DEDUPE_TOKEN_ATTR] = token
-        except (AttributeError, TypeError):
+        if exc.__traceback__ is None:
             return None
 
-    return token
+        exc_dict = exc.__dict__
+        token = exc_dict.get(_DEDUPE_TOKEN_ATTR)
+        if isinstance(token, _DedupeToken):
+            return token
+
+        token = _DedupeToken()
+        exc_dict[_DEDUPE_TOKEN_ATTR] = token
+        return token
+    except Exception:
+        # Exceptions can define ``__dict__`` as a property returning anything,
+        # or back it with a mapping that refuses mutation. None of that may
+        # break event processing, so fall back to the previous behaviour.
+        return None
 
 
 class DedupeIntegration(Integration):
