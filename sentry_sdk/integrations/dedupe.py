@@ -35,21 +35,24 @@ class DedupeIntegration(Integration):
 
             last_seen = integration._last_seen.get(None)
             if last_seen is not None:
-                # last_seen is either a weakref or the original instance
-                last_seen = (
-                    last_seen() if isinstance(last_seen, weakref.ref) else last_seen
-                )
+                # last_seen is a weakref; dereference it to get the original exception.
+                last_seen = last_seen() if isinstance(last_seen, weakref.ref) else None
 
             exc = exc_info[1]
             if last_seen is exc:
                 logger.info("DedupeIntegration dropped duplicated error event %s", exc)
                 return None
 
-            # we can only weakref non builtin types
+            # Store a weakref so we don't hold a strong reference to the exception.
+            # A strong reference would retain the traceback and all frame locals for
+            # the lifetime of the ContextVar (i.e. the asyncio task), causing a
+            # memory leak proportional to the number of live long-running tasks.
+            # Builtin exception types don't support weakrefs; for those we skip
+            # storing rather than falling back to a strong reference.
             try:
                 integration._last_seen.set(weakref.ref(exc))
             except TypeError:
-                integration._last_seen.set(exc)
+                pass
 
             return event
 
